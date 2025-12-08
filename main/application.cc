@@ -598,6 +598,7 @@ void Application::MainEventLoop() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
+            audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
         
@@ -637,6 +638,8 @@ void Application::OnWakeWordDetected() {
         // Set the chat state to wake word detected
         protocol_->SendWakeWordDetected(wake_word);
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+        // Play the pop up sound to indicate the wake word is detected
+        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
 #else
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
         // Play the pop up sound to indicate the wake word is detected
