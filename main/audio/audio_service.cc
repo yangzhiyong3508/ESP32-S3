@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <cmath>
 
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
@@ -50,7 +51,11 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        if (afe_output_callback_) {
+            std::vector<int16_t> copy = data;
+            afe_output_callback_(std::move(copy));
+        }
+        // PCM 直传场景：不再进入 Opus 编码队列，避免压缩
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -275,6 +280,7 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
         codec_->OutputData(task->pcm);
+        ESP_LOGD(TAG, "Played chunk samples=%u", (unsigned int)task->pcm.size());
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -520,6 +526,35 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
     callbacks_ = callbacks;
 }
 
+void AudioService::SetAfeOutputCallback(std::function<void(std::vector<int16_t>&&)> callback) {
+    afe_output_callback_ = callback;
+}
+
+void AudioService::PlayTestTone(int freq_hz, int duration_ms) {
+    if (!codec_) {
+        return;
+    }
+    if (!codec_->output_enabled()) {
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+        codec_->EnableOutput(true);
+    }
+
+    const int sample_rate = codec_->output_sample_rate();
+    const int total_samples = sample_rate * duration_ms / 1000;
+    const float omega = 2.0f * static_cast<float>(M_PI) * static_cast<float>(freq_hz) / static_cast<float>(sample_rate);
+    std::vector<int16_t> pcm;
+    pcm.resize(total_samples);
+    for (int i = 0; i < total_samples; ++i) {
+        float s = std::sin(omega * static_cast<float>(i));
+        pcm[i] = static_cast<int16_t>(s * 6000.0f);
+    }
+
+    codec_->OutputData(pcm);
+    last_output_time_ = std::chrono::steady_clock::now();
+    ESP_LOGI(TAG, "Played test tone freq=%dHz duration=%dms samples=%d", freq_hz, duration_ms, total_samples);
+}
+
 void AudioService::PlaySound(const std::string_view& ogg) {
     if (!codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
@@ -541,6 +576,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     bool seen_head = false;
     bool seen_tags = false;
     int sample_rate = 16000; // 默认值
+    size_t queued_packets = 0;
 
     while (true) {
         size_t pos = find_page(offset);
@@ -591,8 +627,8 @@ void AudioService::PlaySound(const std::string_view& ogg) {
                             // 读取输入采样率 (little-endian)
                             sample_rate = pkt_ptr[12] | (pkt_ptr[13] << 8) | 
                                         (pkt_ptr[14] << 16) | (pkt_ptr[15] << 24);
-                            ESP_LOGI(TAG, "OpusHead: version=%d, channels=%d, sample_rate=%d", 
-                                   version, channel_count, sample_rate);
+                            ESP_LOGD(TAG, "OpusHead: version=%d, channels=%d, sample_rate=%d", 
+                                version, channel_count, sample_rate);
                         }
                     }
                 }
@@ -613,10 +649,13 @@ void AudioService::PlaySound(const std::string_view& ogg) {
             packet->payload.resize(pkt_len);
             std::memcpy(packet->payload.data(), pkt_ptr, pkt_len);
             PushPacketToDecodeQueue(std::move(packet), true);
+            queued_packets++;
         }
 
         offset = body_off + body_size;
     }
+
+    ESP_LOGD(TAG, "Queued %u opus packets for playback (sr=%d)", (unsigned int)queued_packets, sample_rate);
 }
 
 bool AudioService::IsIdle() {

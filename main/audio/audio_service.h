@@ -98,10 +98,12 @@ public:
 
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
+    void SetAfeOutputCallback(std::function<void(std::vector<int16_t>&&)> callback);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
+    void PlayTestTone(int freq_hz = 1000, int duration_ms = 200);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
@@ -118,6 +120,7 @@ private:
     std::unique_ptr<AudioDebugger> audio_debugger_;
     std::unique_ptr<OpusEncoderWrapper> opus_encoder_;
     std::unique_ptr<OpusDecoderWrapper> opus_decoder_;
+    std::function<void(std::vector<int16_t>&&)> afe_output_callback_;
     OpusResampler input_resampler_;
     OpusResampler reference_resampler_;
     OpusResampler output_resampler_;
