@@ -11,9 +11,9 @@
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
+#include "audio/transport/audio_afe_ws_sender.h" // 确保包含此头文件
 
 #define TAG "Application"
-
 
 static const char* const STATE_STRINGS[] = {
     "unknown",
@@ -91,7 +91,6 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
         digit_sound{'9', Lang::Sounds::OGG_9}
     }};
 
-    // This sentence uses 9KB of SRAM, so we need to wait for it to finish
     Alert(Lang::Strings::ACTIVATION, message.c_str(), "link", Lang::Sounds::OGG_ACTIVATION);
 
     for (const auto& digit : code) {
@@ -124,7 +123,6 @@ void Application::DismissAlert() {
 }
 
 void Application::ToggleChatState() {
-    // In offline mode this simply toggles processing on/off
     if (device_state_ == kDeviceStateIdle) {
         SetDeviceState(kDeviceStateListening);
     } else {
@@ -140,59 +138,57 @@ void Application::StopListening() {
     SetDeviceState(kDeviceStateIdle);
 }
 
-
-#include "samples/audio_afe_ws_sender.h"
-
+// ------------------------------------------------------------------------
+// Start: 核心修改区域
+// ------------------------------------------------------------------------
 void Application::Start() {
     auto& board = Board::GetInstance();
     SetDeviceState(kDeviceStateStarting);
 
-    /* Setup the display */
     auto display = board.GetDisplay();
-
-    // Ensure network interface is up before any network services start
     board.StartNetwork();
-
-    // Print board name/version info
     display->SetChatMessage("system", SystemInfo::GetUserAgent().c_str());
 
     /* Setup the audio service */
     auto codec = board.GetAudioCodec();
     audio_service_.Initialize(codec);
     audio_service_.Start();
-    // WiFi连接后自动推送AFE语音流到服务器
-    audio_afe_ws_sender_init();
-    audio_afe_ws_hook(&audio_service_);
 
-    // 开机即开启语音处理链路，让 AFE 输出能被上传
+    // 1. 初始化 WebSocket 发送器
+    audio_afe_ws_sender_init();
+    
+    // 【重要】注释掉 Raw PCM 发送，避免与 Opus 流混淆
+    // audio_afe_ws_hook(&audio_service_); 
+
+    // 2. 开启语音处理（AFE + 编码）
     audio_service_.EnableVoiceProcessing(true);
 
-    // Keep callbacks minimal since we no longer stream audio out
     AudioServiceCallbacks callbacks;
     callbacks.on_vad_change = [this](bool speaking) {
         if (speaking) {
             xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
         }
     };
+    
+    // 3. 将 Opus 编码队列绑定到 WebSocket 发送 (只发 Opus)
+    audio_afe_ws_attach_send_callbacks(&audio_service_, callbacks);
     audio_service_.SetCallbacks(callbacks);
 
-    // Start the main event loop task with priority 3
     xTaskCreate([](void* arg) {
         ((Application*)arg)->MainEventLoop();
         vTaskDelete(NULL);
     }, "main_event_loop", 2048 * 4, this, 3, &main_event_loop_task_handle_);
 
-    /* Start the clock timer to trigger the periodic beep */
     esp_timer_start_periodic(clock_timer_handle_, 1000000);
 
     SystemInfo::PrintHeapStats();
     SetDeviceState(kDeviceStateIdle);
     display->ShowNotification(Lang::Strings::STANDBY);
+    
+    // 开机成功提示音
     audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
-    audio_service_.PlayTestTone();
 }
 
-// Add a async task to MainLoop
 void Application::Schedule(std::function<void()> callback) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -201,9 +197,6 @@ void Application::Schedule(std::function<void()> callback) {
     xEventGroupSetBits(event_group_, MAIN_EVENT_SCHEDULE);
 }
 
-// The Main Event Loop controls the chat state and websocket connection
-// If other tasks need to access the websocket or chat state,
-// they should use Schedule to call this function
 void Application::MainEventLoop() {
     while (true) {
         auto bits = xEventGroupWaitBits(event_group_, MAIN_EVENT_SCHEDULE |
@@ -221,7 +214,8 @@ void Application::MainEventLoop() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
-            audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+            // 【重要】移除了这里每秒播放一次的代码，消除了噪音
+            
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
         
@@ -231,6 +225,9 @@ void Application::MainEventLoop() {
         }
     }
 }
+// ------------------------------------------------------------------------
+// End: 核心修改区域
+// ------------------------------------------------------------------------
 
 void Application::OnWakeWordDetected() {
     SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
@@ -258,7 +255,6 @@ void Application::SetDeviceState(DeviceState state) {
     device_state_ = state;
     ESP_LOGI(TAG, "STATE: %s", STATE_STRINGS[device_state_]);
 
-    // Send the state change event
     DeviceStateEventManager::GetInstance().PostStateChangeEvent(previous_state, state);
 
     auto& board = Board::GetInstance();
@@ -287,7 +283,6 @@ void Application::SetDeviceState(DeviceState state) {
             audio_service_.EnableWakeWordDetection(false);
             break;
         default:
-            // Do nothing
             break;
     }
 }
@@ -295,7 +290,6 @@ void Application::SetDeviceState(DeviceState state) {
 void Application::Reboot() {
     ESP_LOGI(TAG, "Rebooting...");
     audio_service_.Stop();
-
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
 }
@@ -314,18 +308,16 @@ bool Application::CanEnterSleepMode() {
     if (device_state_ != kDeviceStateIdle) {
         return false;
     }
-
     if (!audio_service_.IsIdle()) {
         return false;
     }
-
-    // Now it is safe to enter sleep mode
     return true;
 }
 
 void Application::SendMcpMessage(const std::string& payload) {
     (void)payload;
 }
+
 void Application::SetAecMode(AecMode mode) {
     aec_mode_ = mode;
     Schedule([this]() {

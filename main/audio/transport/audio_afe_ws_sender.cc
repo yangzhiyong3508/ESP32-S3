@@ -6,6 +6,7 @@
 #define TAG "AFE_WS_SENDER"
 
 static bool ws_ready = false;
+static AudioService* g_service = nullptr;
 
 // 延迟到 WiFi 已连接后再去初始化 WebSocket，避免在 netif 未就绪时崩溃
 extern "C" void audio_afe_ws_sender_init(void) {
@@ -31,9 +32,23 @@ void audio_afe_ws_send(const int16_t *data, int samples) {
 
 // 挂载到 AudioService 的 AFE输出回调
 void audio_afe_ws_hook(AudioService* service) {
+    g_service = service;
     service->SetAfeOutputCallback([](std::vector<int16_t>&& pcm) {
         audio_afe_ws_send(pcm.data(), pcm.size());
     });
+}
+
+// 将 Opus 编码后的数据通过发送队列上传
+void audio_afe_ws_attach_send_callbacks(AudioService* service, AudioServiceCallbacks& callbacks) {
+    g_service = service;
+    callbacks.on_send_queue_available = []() {
+        if (!g_service) return;
+        while (true) {
+            auto pkt = g_service->PopPacketFromSendQueue();
+            if (!pkt) break;
+            audio_uploader_send_bytes(pkt->payload.data(), pkt->payload.size());
+        }
+    };
 }
 
 // 用法：

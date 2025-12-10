@@ -1,5 +1,5 @@
 #include "wifi_board.h"
-#include "codecs/es8388_audio_codec.h"
+#include "audio/driver/es8388_audio_codec.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"

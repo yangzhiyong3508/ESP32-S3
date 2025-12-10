@@ -1,13 +1,13 @@
 # Define source files
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
-            "audio/codecs/no_audio_codec.cc"
-            "audio/codecs/box_audio_codec.cc"
-            "audio/codecs/es8311_audio_codec.cc"
-            "audio/codecs/es8374_audio_codec.cc"
-            "audio/codecs/es8388_audio_codec.cc"
-            "audio/codecs/es8389_audio_codec.cc"
-            "audio/codecs/dummy_audio_codec.cc"
+            "audio/driver/no_audio_codec.cc"
+            "audio/driver/box_audio_codec.cc"
+            "audio/driver/es8311_audio_codec.cc"
+            "audio/driver/es8374_audio_codec.cc"
+            "audio/driver/es8388_audio_codec.cc"
+            "audio/driver/es8389_audio_codec.cc"
+            "audio/driver/dummy_audio_codec.cc"
             "audio/processors/audio_debugger.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
@@ -20,11 +20,11 @@ set(SOURCES "audio/audio_codec.cc"
             "device_state_event.cc"
             "assets.cc"
             "main.cc"
-            "samples/audio_uploader.c"
-            "samples/audio_afe_ws_sender.cc"
+            "audio/transport/audio_uploader.c"
+            "audio/transport/audio_afe_ws_sender.cc"
             )
 
-set(INCLUDE_DIRS "." "audio" "protocols")
+set(INCLUDE_DIRS "." "audio" "protocols" "audio/driver" "audio/transport")
 
 # Add board common files
 file(GLOB BOARD_COMMON_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.cc ${CMAKE_CURRENT_SOURCE_DIR}/boards/common/*.c)

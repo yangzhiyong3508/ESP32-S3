@@ -55,7 +55,8 @@ void AudioService::Initialize(AudioCodec* codec) {
             std::vector<int16_t> copy = data;
             afe_output_callback_(std::move(copy));
         }
-        // PCM 直传场景：不再进入 Opus 编码队列，避免压缩
+        // 将 AFE 输出送入发送队列；PushTaskToEncodeQueue 自带丢弃策略避免阻塞
+        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -410,9 +411,10 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
         timestamp_queue_.pop_front();
     }
 
-    audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
-    audio_encode_queue_.push_back(std::move(task));
-    audio_queue_cv_.notify_all();
+    if (audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE) {
+        audio_encode_queue_.push_back(std::move(task));
+        audio_queue_cv_.notify_all();
+    }
 }
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
