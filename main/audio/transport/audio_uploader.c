@@ -21,7 +21,7 @@
 #define SEND_DROP_THRESHOLD 24
 
 // ---------------- WebSocket 配置 ----------------
-#define WEBSOCKET_URI   "ws://192.168.1.105:8080/esp32"
+#define WEBSOCKET_URI   "ws://192.168.1.107:8080/esp32"
 #define TAG             "ws_client"
 
 static esp_websocket_client_handle_t ws_client = NULL;
