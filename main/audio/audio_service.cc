@@ -558,10 +558,13 @@ void AudioService::PlayTestTone(int freq_hz, int duration_ms) {
 }
 
 void AudioService::PlaySound(const std::string_view& ogg) {
+    ESP_LOGI(TAG, "PlaySound called, size=%d", (int)ogg.size());
+    
     if (!codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
         codec_->EnableOutput(true);
+        ESP_LOGI(TAG, "Output enabled");
     }
 
     const uint8_t* buf = reinterpret_cast<const uint8_t*>(ogg.data());
@@ -629,7 +632,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
                             // 读取输入采样率 (little-endian)
                             sample_rate = pkt_ptr[12] | (pkt_ptr[13] << 8) | 
                                         (pkt_ptr[14] << 16) | (pkt_ptr[15] << 24);
-                            ESP_LOGD(TAG, "OpusHead: version=%d, channels=%d, sample_rate=%d", 
+                            ESP_LOGI(TAG, "OpusHead: version=%d, channels=%d, sample_rate=%d", 
                                 version, channel_count, sample_rate);
                         }
                     }
@@ -657,7 +660,7 @@ void AudioService::PlaySound(const std::string_view& ogg) {
         offset = body_off + body_size;
     }
 
-    ESP_LOGD(TAG, "Queued %u opus packets for playback (sr=%d)", (unsigned int)queued_packets, sample_rate);
+    ESP_LOGI(TAG, "Queued %u opus packets for playback (sr=%d)", (unsigned int)queued_packets, sample_rate);
 }
 
 bool AudioService::IsIdle() {

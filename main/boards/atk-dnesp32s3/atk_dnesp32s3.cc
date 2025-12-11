@@ -71,6 +71,12 @@ private:
 
         // Initialize XL9555
         xl9555_ = new XL9555(i2c_bus_, 0x20);
+
+        // 打开扬声器功放：XL9555 IO0_2 置低（低电平使能）
+        if (xl9555_) {
+            xl9555_->SetOutputState(AUDIO_PA_XL9555_BIT, 0);
+            ESP_LOGI(TAG, "Speaker amplifier enabled (active-low) on XL9555 IO0_%d", AUDIO_PA_XL9555_BIT);
+        }
     }
 
     void InitializeButtons() {

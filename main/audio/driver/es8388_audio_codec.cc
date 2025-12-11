@@ -183,14 +183,32 @@ void Es8388AudioCodec::EnableOutput(bool enable) {
         ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, output_volume_));
 
         // Set analog output volume to 0dB, default is -45dB
-        uint8_t reg_val = 30; // 0dB
+        // 0x1E = 30 (0dB)
+        uint8_t reg_val = 30; 
         if(input_reference_){
             reg_val = 27;
         }
+        
+        // 1. 设置音量 (原代码)
+        // LOUT2/ROUT2 的音量寄存器是 48 和 49
         uint8_t regs[] = { 46, 47, 48, 49 }; // HP_LVOL, HP_RVOL, SPK_LVOL, SPK_RVOL
         for (uint8_t reg : regs) {
             ctrl_if_->write_reg(ctrl_if_, reg, 1, &reg_val, 1);
         }
+
+        // ================================================================
+        // 【新增代码】: 强制开启 LOUT2/ROUT2 输出通道
+        // Register 0x04 是 DAC Power Control
+        // 值 0x3C (二进制 0011 1100) 代表同时开启 LOUT1, ROUT1, LOUT2, ROUT2
+        // ================================================================
+        uint8_t power_reg_val = 0x3C; 
+        ctrl_if_->write_reg(ctrl_if_, 0x04, 1, &power_reg_val, 1);
+        
+        // 额外保险：确保 DAC Control 寄存器没有静音 LOUT2
+        // 虽然通常由音量寄存器控制，但防止某些默认配置置位
+        // Register 0x02 (DAC Control 1)
+        // uint8_t dac_ctrl_val = 0x00; 
+        // ctrl_if_->write_reg(ctrl_if_, 0x02, 1, &dac_ctrl_val, 1);
 
         if (pa_pin_ != GPIO_NUM_NC) {
             gpio_set_level(pa_pin_, 1);

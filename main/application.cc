@@ -154,6 +154,9 @@ void Application::Start() {
     audio_service_.Initialize(codec);
     audio_service_.Start();
 
+    // 强制设置音量为60
+    Board::GetInstance().GetAudioCodec()->SetOutputVolume(60);
+
     // 1. 初始化 WebSocket 发送器
     audio_afe_ws_sender_init();
     
@@ -173,6 +176,9 @@ void Application::Start() {
     // 3. 将 Opus 编码队列绑定到 WebSocket 发送 (只发 Opus)
     audio_afe_ws_attach_send_callbacks(&audio_service_, callbacks);
     audio_service_.SetCallbacks(callbacks);
+
+    // 4. 绑定下行音频：服务端推送的 Opus 数据将直接送入解码/播放队列
+    audio_afe_ws_attach_downlink(&audio_service_);
 
     xTaskCreate([](void* arg) {
         ((Application*)arg)->MainEventLoop();
@@ -214,8 +220,6 @@ void Application::MainEventLoop() {
 
         if (bits & MAIN_EVENT_CLOCK_TICK) {
             clock_ticks_++;
-            // 【重要】移除了这里每秒播放一次的代码，消除了噪音
-            
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
         

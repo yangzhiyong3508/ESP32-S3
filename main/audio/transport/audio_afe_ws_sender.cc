@@ -2,6 +2,7 @@
 #include "audio_service.h"
 #include "boards/common/wifi_connect.h"
 #include <esp_log.h>
+#include <memory>
 
 #define TAG "AFE_WS_SENDER"
 
@@ -49,6 +50,29 @@ void audio_afe_ws_attach_send_callbacks(AudioService* service, AudioServiceCallb
             audio_uploader_send_bytes(pkt->payload.data(), pkt->payload.size());
         }
     };
+}
+
+// 将服务端推送的 Opus 二进制数据放入解码队列
+void audio_afe_ws_attach_downlink(AudioService* service) {
+    g_service = service;
+    audio_uploader_set_binary_cb([](const uint8_t* data, size_t len) {
+        if (!g_service || !data || len == 0) {
+            return;
+        }
+
+        auto packet = std::make_unique<AudioStreamPacket>();
+        packet->sample_rate = 24000;                 // 匹配硬件输出采样率，避免重采样
+        packet->frame_duration = OPUS_FRAME_DURATION_MS;
+        packet->payload.assign(data, data + len);
+
+        if (!g_service->PushPacketToDecodeQueue(std::move(packet), false)) {
+            ESP_LOGW(TAG, "decode queue full, drop downstream audio len=%d", (int)len);
+        }
+    });
+
+    audio_uploader_set_text_cb([](const char* data, size_t len) {
+        ESP_LOGI(TAG, "WS text: %.*s", (int)len, data);
+    });
 }
 
 // 用法：

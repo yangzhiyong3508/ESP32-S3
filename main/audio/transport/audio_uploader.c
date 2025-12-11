@@ -21,7 +21,7 @@
 #define SEND_DROP_THRESHOLD 24
 
 // ---------------- WebSocket 配置 ----------------
-#define WEBSOCKET_URI   "ws://192.168.1.107:8080/esp32"
+#define WEBSOCKET_URI   "ws://192.168.1.106:8080/esp32"
 #define TAG             "ws_client"
 
 static esp_websocket_client_handle_t ws_client = NULL;
@@ -30,6 +30,10 @@ static QueueHandle_t send_queue = NULL;
 static TaskHandle_t send_task_handle = NULL;
 static int send_budget = SEND_BUDGET_BYTES_PER_SEC;
 static int64_t budget_ts_us = 0;
+
+// 下行数据回调（由上层注册）
+static audio_uploader_binary_cb_t binary_cb = NULL;
+static audio_uploader_text_cb_t text_cb = NULL;
 
 typedef struct {
     size_t len;
@@ -58,7 +62,19 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
             }
             break;
         case WEBSOCKET_EVENT_DATA:
-            ESP_LOGI(TAG, "收到: %.*s", data->data_len, (char*)data->data_ptr);
+            if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
+                if (binary_cb) {
+                    binary_cb((const uint8_t*)data->data_ptr, data->data_len);
+                } else {
+                    ESP_LOGI(TAG, "收到二进制数据 len=%d", data->data_len);
+                }
+            } else {
+                if (text_cb) {
+                    text_cb((const char*)data->data_ptr, data->data_len);
+                } else {
+                    ESP_LOGI(TAG, "收到文本: %.*s", data->data_len, (char*)data->data_ptr);
+                }
+            }
             break;
         case WEBSOCKET_EVENT_ERROR:
             ESP_LOGE(TAG, "WebSocket错误");
@@ -176,6 +192,14 @@ static void enqueue_bytes(const uint8_t* data, size_t len) {
 
 void audio_uploader_send_bytes(const uint8_t *data, size_t len) {
     enqueue_bytes(data, len);
+}
+
+void audio_uploader_set_binary_cb(audio_uploader_binary_cb_t cb) {
+    binary_cb = cb;
+}
+
+void audio_uploader_set_text_cb(audio_uploader_text_cb_t cb) {
+    text_cb = cb;
 }
 
 void audio_uploader_send(const int16_t *data, int samples) {
