@@ -21,7 +21,7 @@
 #define SEND_DROP_THRESHOLD 24
 
 // ---------------- WebSocket 配置 ----------------
-#define WEBSOCKET_URI   "ws://192.168.1.106:8080/esp32"
+#define WEBSOCKET_URI   "ws://192.168.1.105:8080/esp32"
 #define TAG             "ws_client"
 
 static esp_websocket_client_handle_t ws_client = NULL;
@@ -77,7 +77,7 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
             }
             break;
         case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGE(TAG, "WebSocket错误");
+            ESP_LOGE(TAG, "WebSocket错误，event_id=%d", event_id);
             break;
     }
 }
@@ -112,8 +112,10 @@ static void audio_send_task(void* arg) {
             continue;
         }
 
-        if (!ws_connected || ws_client == NULL) {
+        if (ws_client == NULL || !esp_websocket_client_is_connected(ws_client) || !ws_connected) {
+            // 客户端未连接，释放帧并稍作等待，给内部 reconnect 机制一点时间
             free(frame.buf);
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
@@ -122,7 +124,8 @@ static void audio_send_task(void* arg) {
 
         if (ret <= 0) {
             ESP_LOGW(TAG, "send failed, drop frame len=%d", (int)frame.len);
-            // 等待下一次事件驱动的重连
+            // 如果发送失败，给 reconnect 机制时间，再短暂等待
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
 
         // 适当让出 CPU，避免连续写填满对端窗口
@@ -142,7 +145,11 @@ void audio_uploader_init(void) {
 }
 
 static void enqueue_bytes(const uint8_t* data, size_t len) {
-    if (!ws_connected || ws_client == NULL || send_queue == NULL) {
+    if (ws_client == NULL || send_queue == NULL) {
+        return; // 无客户端或队列直接丢弃
+    }
+    if (!esp_websocket_client_is_connected(ws_client) || !ws_connected) {
+        ESP_LOGW(TAG, "enqueue_bytes: websocket not connected, drop len=%d", (int)len);
         return; // 未连接直接丢弃
     }
 
