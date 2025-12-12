@@ -6,14 +6,13 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
-#include "esp_timer.h"
 
 // ---------------- 配置 ----------------
 #define WEBSOCKET_URI           "ws://192.168.1.105:8080/esp32"
 #define TAG                     "WS_UPLOADER"
 
-// 队列深度：Opus 60ms帧，1秒约16帧。设置50可以缓冲约3秒的网络抖动
-#define SEND_QUEUE_LEN          50 
+// 队列深度：Opus 60ms帧，150帧约9秒。
+#define SEND_QUEUE_LEN          150 
 #define WS_SEND_TIMEOUT_MS      1000
 
 // ---------------- 状态管理 ----------------
@@ -21,16 +20,15 @@ static esp_websocket_client_handle_t ws_client = NULL;
 static QueueHandle_t send_queue = NULL;
 static TaskHandle_t send_task_handle = NULL;
 
-// 使用 volatile bool 避免多线程锁竞争，快速判断连接状态
+// 使用 volatile bool 避免多线程锁竞争
 static volatile bool is_connected = false;
 
-// 回调函数
 static audio_uploader_binary_cb_t binary_cb = NULL;
 static audio_uploader_text_cb_t text_cb = NULL;
 
 typedef struct {
     size_t len;
-    uint8_t* buf; // 拥有所有权，需要在发送后 free
+    uint8_t* buf; 
 } queue_item_t;
 
 // ---------------- WebSocket 事件处理 ----------------
@@ -49,12 +47,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             break;
 
         case WEBSOCKET_EVENT_DATA:
-            // 处理下行数据 (服务器发来的音频或指令)
             if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
                 if (binary_cb) binary_cb((const uint8_t*)data->data_ptr, data->data_len);
             } else if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
                 if (text_cb) text_cb((const char*)data->data_ptr, data->data_len);
-                else ESP_LOGI(TAG, "Received Text: %.*s", data->data_len, (char*)data->data_ptr);
             }
             break;
 
@@ -64,30 +60,58 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
     }
 }
 
+// 🔥 新增：清空队列
+// 当网络断开时，必须清空积压的旧数据，否则重连后你会听到几秒前的录音，产生巨大延迟
+static void clear_queue() {
+    queue_item_t item;
+    int dropped_count = 0;
+    while (xQueueReceive(send_queue, &item, 0) == pdTRUE) {
+        if (item.buf) free(item.buf);
+        dropped_count++;
+    }
+    if (dropped_count > 0) {
+        ESP_LOGW(TAG, "网络中断，丢弃积压音频包: %d 个", dropped_count);
+    }
+}
+
 // ---------------- 发送任务 (消费者) ----------------
 static void audio_send_task(void* arg) {
     queue_item_t item;
     
     while (true) {
-        // 永久阻塞等待队列数据，避免 CPU 空转
+        // 1. 等待数据
         if (xQueueReceive(send_queue, &item, portMAX_DELAY) == pdTRUE) {
             
-            // 再次检查连接状态
+            // 2. 检查连接状态
             if (is_connected && ws_client != NULL) {
-                // 发送数据：注意这里不分片！Opus 包必须完整发送
+                
                 int ret = esp_websocket_client_send_bin(ws_client, (const char*)item.buf, item.len, pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
                 
+                // 🔥 核心修复：发送失败时的熔断机制
                 if (ret < 0) {
-                    ESP_LOGE(TAG, "Send failed, ret=%d. Connection might be unstable.", ret);
-                    // 发送失败通常意味着连接出问题了，暂时标记为断开，等待重连事件
-                    // is_connected = false; // 可选：让事件回调去处理状态
+                    ESP_LOGE(TAG, "发送失败 (ret=%d)，暂停发送等待重连...", ret);
+                    
+                    // A. 强制标记断开，阻止新数据入队
+                    is_connected = false; 
+                    
+                    // B. 释放当前包内存
+                    if (item.buf) free(item.buf); 
+
+                    // C. 清空所有积压队列 (避免延迟和内存泄漏)
+                    clear_queue();
+
+                    // D. 🔥 强制休眠 2 秒！
+                    // 这是解决刷屏的关键。给底层 Wi-Fi 协议栈时间去扫描和重连，
+                    // 避免 CPU 被死循环占满导致 Wi-Fi 无法恢复。
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    continue; // 跳过本次循环剩余部分，进入下一轮等待
                 }
             } else {
-                // 如果取出数据时发现断连了，静默丢弃，避免日志刷屏
-                // 可以每隔 100 个包打印一次警告，这里为了清爽省略
+                // 如果取出数据时发现已经断连了 (is_connected == false)
+                if (item.buf) free(item.buf);
             }
 
-            // 无论发送成功与否，必须释放内存
+            // 正常发送成功，释放内存
             if (item.buf) {
                 free(item.buf);
             }
@@ -98,64 +122,50 @@ static void audio_send_task(void* arg) {
 // ---------------- 公共接口 ----------------
 
 void audio_uploader_init(void) {
-    // 1. 创建队列
     if (send_queue == NULL) {
         send_queue = xQueueCreate(SEND_QUEUE_LEN, sizeof(queue_item_t));
     }
 
-    // 2. 初始化 WebSocket
     esp_websocket_client_config_t config = {
         .uri = WEBSOCKET_URI,
-        .reconnect_timeout_ms = 5000,   // 缩短重连间隔
-        .network_timeout_ms = 10000,    // 增加网络超时时间
-        .buffer_size = 4096,            // 接收缓冲区
+        .reconnect_timeout_ms = 3000,   // 3秒重连
+        .network_timeout_ms = 5000,     // 5秒超时
+        .buffer_size = 4096,
         .disable_auto_reconnect = false,
         .keep_alive_enable = true,
-        .keep_alive_idle = 5,
-        .keep_alive_interval = 5,
-        .keep_alive_count = 3
+        .keep_alive_idle = 4,           // 激进的保活检测：4秒无数据就检测
+        .keep_alive_interval = 4,
+        .keep_alive_count = 2
     };
 
     ws_client = esp_websocket_client_init(&config);
     esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
     esp_websocket_client_start(ws_client);
 
-    // 3. 创建发送任务
     if (send_task_handle == NULL) {
-        // 优先级设置适中，不要太高抢占音频处理，也不要太低发不出去
         xTaskCreate(audio_send_task, "ws_send_task", 4096, NULL, 5, &send_task_handle);
     }
 }
 
 void audio_uploader_send_bytes(const uint8_t *data, size_t len) {
-    // 1. 快速检查连接状态：如果断连，直接丢弃，不进队列，防止内存耗尽
+    // 1. 快速检查：断连时直接丢弃，不进队列
     if (!is_connected || data == NULL || len == 0) {
         return;
     }
 
-    // 2. 检查队列余量：如果队列太满（说明网络发不出去），丢弃最新的，保全实时性
+    // 2. 队列满时丢弃最新的（保最新）
     if (uxQueueSpacesAvailable(send_queue) < 5) {
-        ESP_LOGW(TAG, "Queue full, dropping packet to reduce latency");
+        // ESP_LOGW(TAG, "队列满，丢包"); // 注释掉减少日志干扰
         return;
     }
 
-    // 3. 分配内存并复制数据
-    // 注意：这里必须 copy，因为上层 buffer (Opus payload) 马上会被复用或释放
     uint8_t* buf_copy = (uint8_t*)malloc(len);
-    if (!buf_copy) {
-        ESP_LOGE(TAG, "Malloc failed");
-        return;
-    }
+    if (!buf_copy) return;
     memcpy(buf_copy, data, len);
 
-    queue_item_t item = {
-        .len = len,
-        .buf = buf_copy
-    };
+    queue_item_t item = { .len = len, .buf = buf_copy };
 
-    // 4. 入队
     if (xQueueSend(send_queue, &item, 0) != pdTRUE) {
-        // 极罕见情况：刚检查还有空间，现在满了
         free(buf_copy);
     }
 }
