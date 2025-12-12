@@ -2,6 +2,7 @@
 #include <esp_log.h>
 #include <cstring>
 #include <cmath>
+#include "audio_uploader.h"
 
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
@@ -300,31 +301,36 @@ void AudioService::AudioOutputTask() {
 }
 
 void AudioService::OpusCodecTask() {
+    ESP_LOGI(TAG, "Opus codec task started");
+    
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() {
             return service_stopped_ ||
-                (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) ||
+                !audio_encode_queue_.empty() ||
                 (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE);
         });
+
         if (service_stopped_) {
             break;
         }
 
-        /* Decode the audio from decode queue */
+        /* ------------------ Decoding Logic (Server -> Speaker) ------------------ */
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
             audio_queue_cv_.notify_all();
-            lock.unlock();
+            lock.unlock(); // 解锁进行耗时操作
 
             auto task = std::make_unique<AudioTask>();
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
+            
+            // 解码 Opus
             if (opus_decoder_->Decode(std::move(packet->payload), task->pcm)) {
-                // Resample if the sample rate is different
+                // 重采样逻辑
                 if (opus_decoder_->sample_rate() != codec_->output_sample_rate()) {
                     int target_size = output_resampler_.GetOutputSamples(task->pcm.size());
                     std::vector<int16_t> resampled(target_size);
@@ -332,9 +338,10 @@ void AudioService::OpusCodecTask() {
                     task->pcm = std::move(resampled);
                 }
 
+                // 放入播放队列
                 lock.lock();
                 audio_playback_queue_.push_back(std::move(task));
-                audio_queue_cv_.notify_all();
+                audio_queue_cv_.notify_all(); // 通知 OutputTask
             } else {
                 ESP_LOGE(TAG, "Failed to decode audio");
                 lock.lock();
@@ -342,35 +349,48 @@ void AudioService::OpusCodecTask() {
             debug_statistics_.decode_count++;
         }
         
-        /* Encode the audio to send queue */
-        if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+        /* ------------------ Encoding Logic (Mic -> Server) ------------------ */
+        // 注意：这里不需要再检查 audio_send_queue_ 的大小，因为我们直接发给 uploader
+        if (!audio_encode_queue_.empty()) {
+            // 如果还持有锁，先释放，取出任务
+            if (!lock.owns_lock()) lock.lock();
+            
             auto task = std::move(audio_encode_queue_.front());
             audio_encode_queue_.pop_front();
             audio_queue_cv_.notify_all();
-            lock.unlock();
+            lock.unlock(); // 解锁进行耗时编码
 
-            auto packet = std::make_unique<AudioStreamPacket>();
-            packet->frame_duration = OPUS_FRAME_DURATION_MS;
-            packet->sample_rate = 16000;
-            packet->timestamp = task->timestamp;
-            if (!opus_encoder_->Encode(std::move(task->pcm), packet->payload)) {
+            // 准备编码输出容器
+            std::vector<uint8_t> encoded_payload;
+            
+            // 执行编码
+            if (opus_encoder_->Encode(std::move(task->pcm), encoded_payload)) {
+                
+                // 处理编码后的数据
+                if (task->type == kAudioTaskTypeEncodeToSendQueue) {
+                    // === 核心修改：直接发送给 WebSocket Uploader ===
+                    // 不再存入 audio_send_queue_，减少内存占用和延迟
+                    // encoded_payload.data() 是 Opus 数据，encoded_payload.size() 是长度
+                    audio_uploader_send_bytes(encoded_payload.data(), encoded_payload.size());
+
+                } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
+                    // 用于本地测试的回环逻辑 (Boot Button 测试)
+                    auto packet = std::make_unique<AudioStreamPacket>();
+                    packet->payload = std::move(encoded_payload);
+                    packet->frame_duration = OPUS_FRAME_DURATION_MS;
+                    packet->sample_rate = 16000;
+                    
+                    lock.lock();
+                    audio_testing_queue_.push_back(std::move(packet));
+                    lock.unlock();
+                }
+                
+                debug_statistics_.encode_count++;
+            } else {
                 ESP_LOGE(TAG, "Failed to encode audio");
-                continue;
             }
-
-            if (task->type == kAudioTaskTypeEncodeToSendQueue) {
-                {
-                    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-                    audio_send_queue_.push_back(std::move(packet));
-                }
-                if (callbacks_.on_send_queue_available) {
-                    callbacks_.on_send_queue_available();
-                }
-            } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
-                std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-                audio_testing_queue_.push_back(std::move(packet));
-            }
-            debug_statistics_.encode_count++;
+            
+            // 循环回来重新获取锁
             lock.lock();
         }
     }

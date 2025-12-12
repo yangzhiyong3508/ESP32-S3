@@ -1,204 +1,168 @@
+#include "audio_uploader.h"
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
-#include "nvs_flash.h"
 #include "esp_websocket_client.h"
-#include "audio_uploader.h"
+#include "esp_timer.h"
 
-// 使用简单发送队列，避免在音频回调里直接阻塞 socket
-// 将帧拆小以减少一次写入的阻塞概率
-#define MAX_FRAME_BYTES 512
-#define SEND_QUEUE_LEN 32
-// 发送速率限制（字节/秒），超出则短暂延时以平滑带宽
-#define SEND_BUDGET_BYTES_PER_SEC 16000
-// 当队列积压超过该阈值时，放弃当前帧剩余数据
-#define SEND_DROP_THRESHOLD 24
+// ---------------- 配置 ----------------
+#define WEBSOCKET_URI           "ws://192.168.1.105:8080/esp32"
+#define TAG                     "WS_UPLOADER"
 
-// ---------------- WebSocket 配置 ----------------
-#define WEBSOCKET_URI   "ws://192.168.1.105:8080/esp32"
-#define TAG             "ws_client"
+// 队列深度：Opus 60ms帧，1秒约16帧。设置50可以缓冲约3秒的网络抖动
+#define SEND_QUEUE_LEN          50 
+#define WS_SEND_TIMEOUT_MS      1000
 
+// ---------------- 状态管理 ----------------
 static esp_websocket_client_handle_t ws_client = NULL;
-static bool ws_connected = false;
 static QueueHandle_t send_queue = NULL;
 static TaskHandle_t send_task_handle = NULL;
-static int send_budget = SEND_BUDGET_BYTES_PER_SEC;
-static int64_t budget_ts_us = 0;
 
-// 下行数据回调（由上层注册）
+// 使用 volatile bool 避免多线程锁竞争，快速判断连接状态
+static volatile bool is_connected = false;
+
+// 回调函数
 static audio_uploader_binary_cb_t binary_cb = NULL;
 static audio_uploader_text_cb_t text_cb = NULL;
 
 typedef struct {
     size_t len;
-    uint8_t* buf;
-} audio_frame_t;
+    uint8_t* buf; // 拥有所有权，需要在发送后 free
+} queue_item_t;
 
-// ---------------- WebSocket 事件 ----------------
-static void websocket_event_handler(void *handler_args, esp_event_base_t base,
-                                   int32_t event_id, void *event_data) {
+// ---------------- WebSocket 事件处理 ----------------
+static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
-            ws_connected = true;
-            ESP_LOGI(TAG, "WebSocket已连接");
+            ESP_LOGI(TAG, "WebSocket Connected!");
+            is_connected = true;
             break;
+
         case WEBSOCKET_EVENT_DISCONNECTED:
-            ws_connected = false;
-            ESP_LOGI(TAG, "WebSocket已断开");
-            // 清空发送队列，避免积压
-            if (send_queue) {
-                audio_frame_t frame;
-                while (xQueueReceive(send_queue, &frame, 0) == pdTRUE) {
-                    free(frame.buf);
-                }
-            }
+            ESP_LOGW(TAG, "WebSocket Disconnected!");
+            is_connected = false;
             break;
+
         case WEBSOCKET_EVENT_DATA:
+            // 处理下行数据 (服务器发来的音频或指令)
             if (data->op_code == WS_TRANSPORT_OPCODES_BINARY) {
-                if (binary_cb) {
-                    binary_cb((const uint8_t*)data->data_ptr, data->data_len);
-                } else {
-                    ESP_LOGI(TAG, "收到二进制数据 len=%d", data->data_len);
-                }
-            } else {
-                if (text_cb) {
-                    text_cb((const char*)data->data_ptr, data->data_len);
-                } else {
-                    ESP_LOGI(TAG, "收到文本: %.*s", data->data_len, (char*)data->data_ptr);
-                }
+                if (binary_cb) binary_cb((const uint8_t*)data->data_ptr, data->data_len);
+            } else if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
+                if (text_cb) text_cb((const char*)data->data_ptr, data->data_len);
+                else ESP_LOGI(TAG, "Received Text: %.*s", data->data_len, (char*)data->data_ptr);
             }
             break;
+
         case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGE(TAG, "WebSocket错误，event_id=%d", event_id);
+            ESP_LOGE(TAG, "WebSocket Error!");
             break;
     }
 }
 
-// ---------------- WebSocket 初始化 ----------------
-static void websocket_init(void) {
-    esp_websocket_client_config_t config = {
-        .uri = WEBSOCKET_URI,
-        .reconnect_timeout_ms = 10000,
-        .network_timeout_ms = 10000,
-        // 增大发送缓冲区，以应对网络抖动
-        // 设置为 64KB，以适配拆分后的小块累计
-        .buffer_size = 65536,
-        // 启用 TCP keep-alive，避免长时间静默被对端关闭
-        .keep_alive_enable = true,
-        .keep_alive_idle = 5,      // 秒，空闲多久开始发保活
-        .keep_alive_interval = 5,  // 秒，保活包间隔
-        .keep_alive_count = 3,     // 尝试次数
-    };
-    ws_client = esp_websocket_client_init(&config);
-    esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY,
-                                  websocket_event_handler, NULL);
-    esp_websocket_client_start(ws_client);
-}
-
-// 发送任务：串行发送队列中的 PCM 帧，失败时丢弃该帧并等待重连
+// ---------------- 发送任务 (消费者) ----------------
 static void audio_send_task(void* arg) {
-    (void)arg;
-    audio_frame_t frame;
-    for (;;) {
-        if (xQueueReceive(send_queue, &frame, portMAX_DELAY) != pdTRUE) {
-            continue;
+    queue_item_t item;
+    
+    while (true) {
+        // 永久阻塞等待队列数据，避免 CPU 空转
+        if (xQueueReceive(send_queue, &item, portMAX_DELAY) == pdTRUE) {
+            
+            // 再次检查连接状态
+            if (is_connected && ws_client != NULL) {
+                // 发送数据：注意这里不分片！Opus 包必须完整发送
+                int ret = esp_websocket_client_send_bin(ws_client, (const char*)item.buf, item.len, pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
+                
+                if (ret < 0) {
+                    ESP_LOGE(TAG, "Send failed, ret=%d. Connection might be unstable.", ret);
+                    // 发送失败通常意味着连接出问题了，暂时标记为断开，等待重连事件
+                    // is_connected = false; // 可选：让事件回调去处理状态
+                }
+            } else {
+                // 如果取出数据时发现断连了，静默丢弃，避免日志刷屏
+                // 可以每隔 100 个包打印一次警告，这里为了清爽省略
+            }
+
+            // 无论发送成功与否，必须释放内存
+            if (item.buf) {
+                free(item.buf);
+            }
         }
-
-        if (ws_client == NULL || !esp_websocket_client_is_connected(ws_client) || !ws_connected) {
-            // 客户端未连接，释放帧并稍作等待，给内部 reconnect 机制一点时间
-            free(frame.buf);
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-
-        int ret = esp_websocket_client_send_bin(ws_client, (const char*)frame.buf, frame.len, 500 / portTICK_PERIOD_MS);
-        free(frame.buf);
-
-        if (ret <= 0) {
-            ESP_LOGW(TAG, "send failed, drop frame len=%d", (int)frame.len);
-            // 如果发送失败，给 reconnect 机制时间，再短暂等待
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-
-        // 适当让出 CPU，避免连续写填满对端窗口
-        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
 // ---------------- 公共接口 ----------------
+
 void audio_uploader_init(void) {
+    // 1. 创建队列
     if (send_queue == NULL) {
-        send_queue = xQueueCreate(SEND_QUEUE_LEN, sizeof(audio_frame_t));
+        send_queue = xQueueCreate(SEND_QUEUE_LEN, sizeof(queue_item_t));
     }
+
+    // 2. 初始化 WebSocket
+    esp_websocket_client_config_t config = {
+        .uri = WEBSOCKET_URI,
+        .reconnect_timeout_ms = 5000,   // 缩短重连间隔
+        .network_timeout_ms = 10000,    // 增加网络超时时间
+        .buffer_size = 4096,            // 接收缓冲区
+        .disable_auto_reconnect = false,
+        .keep_alive_enable = true,
+        .keep_alive_idle = 5,
+        .keep_alive_interval = 5,
+        .keep_alive_count = 3
+    };
+
+    ws_client = esp_websocket_client_init(&config);
+    esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
+    esp_websocket_client_start(ws_client);
+
+    // 3. 创建发送任务
     if (send_task_handle == NULL) {
-        xTaskCreate(audio_send_task, "audio_send", 3072, NULL, 5, &send_task_handle);
-    }
-    websocket_init();
-}
-
-static void enqueue_bytes(const uint8_t* data, size_t len) {
-    if (ws_client == NULL || send_queue == NULL) {
-        return; // 无客户端或队列直接丢弃
-    }
-    if (!esp_websocket_client_is_connected(ws_client) || !ws_connected) {
-        ESP_LOGW(TAG, "enqueue_bytes: websocket not connected, drop len=%d", (int)len);
-        return; // 未连接直接丢弃
-    }
-
-    // 按最大帧拆分，减少单次写阻塞
-    const uint8_t* ptr = (const uint8_t*)data;
-    size_t remaining = len;
-    while (remaining > 0) {
-        size_t chunk = remaining > MAX_FRAME_BYTES ? MAX_FRAME_BYTES : remaining;
-
-        // 简单令牌桶：每秒允许 SEND_BUDGET_BYTES_PER_SEC，超出则等待 10ms
-        int64_t now = esp_timer_get_time();
-        if (budget_ts_us == 0 || now - budget_ts_us >= 1000000) {
-            budget_ts_us = now;
-            send_budget = SEND_BUDGET_BYTES_PER_SEC;
-        }
-        if (send_budget <= 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        if (chunk > send_budget) {
-            chunk = send_budget;
-        }
-
-        audio_frame_t frame = {0};
-        frame.len = chunk;
-        frame.buf = (uint8_t*)malloc(chunk);
-        if (!frame.buf) {
-            return; // 内存不足直接放弃剩余
-        }
-        memcpy(frame.buf, ptr, chunk);
-
-        if (xQueueSend(send_queue, &frame, 0) != pdTRUE) {
-            free(frame.buf); // 队列满则丢弃当前块
-            return; // 避免积压，剩余也放弃
-        }
-
-        // 队列积压过高，主动丢弃剩余数据，防止 AFE 堵塞
-        if (uxQueueMessagesWaiting(send_queue) > SEND_DROP_THRESHOLD) {
-            return;
-        }
-
-        ptr += chunk;
-        remaining -= chunk;
-        send_budget -= chunk;
+        // 优先级设置适中，不要太高抢占音频处理，也不要太低发不出去
+        xTaskCreate(audio_send_task, "ws_send_task", 4096, NULL, 5, &send_task_handle);
     }
 }
 
 void audio_uploader_send_bytes(const uint8_t *data, size_t len) {
-    enqueue_bytes(data, len);
+    // 1. 快速检查连接状态：如果断连，直接丢弃，不进队列，防止内存耗尽
+    if (!is_connected || data == NULL || len == 0) {
+        return;
+    }
+
+    // 2. 检查队列余量：如果队列太满（说明网络发不出去），丢弃最新的，保全实时性
+    if (uxQueueSpacesAvailable(send_queue) < 5) {
+        ESP_LOGW(TAG, "Queue full, dropping packet to reduce latency");
+        return;
+    }
+
+    // 3. 分配内存并复制数据
+    // 注意：这里必须 copy，因为上层 buffer (Opus payload) 马上会被复用或释放
+    uint8_t* buf_copy = (uint8_t*)malloc(len);
+    if (!buf_copy) {
+        ESP_LOGE(TAG, "Malloc failed");
+        return;
+    }
+    memcpy(buf_copy, data, len);
+
+    queue_item_t item = {
+        .len = len,
+        .buf = buf_copy
+    };
+
+    // 4. 入队
+    if (xQueueSend(send_queue, &item, 0) != pdTRUE) {
+        // 极罕见情况：刚检查还有空间，现在满了
+        free(buf_copy);
+    }
+}
+
+// 兼容接口：如果还想发 PCM，封装一下即可
+void audio_uploader_send(const int16_t *data, int samples) {
+    audio_uploader_send_bytes((const uint8_t*)data, samples * sizeof(int16_t));
 }
 
 void audio_uploader_set_binary_cb(audio_uploader_binary_cb_t cb) {
@@ -207,8 +171,4 @@ void audio_uploader_set_binary_cb(audio_uploader_binary_cb_t cb) {
 
 void audio_uploader_set_text_cb(audio_uploader_text_cb_t cb) {
     text_cb = cb;
-}
-
-void audio_uploader_send(const int16_t *data, int samples) {
-    enqueue_bytes((const uint8_t*)data, samples * sizeof(int16_t));
 }
