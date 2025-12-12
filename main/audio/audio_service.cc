@@ -51,10 +51,18 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+        // 当扬声器正在播放时，不将麦克风数据发送到服务器，直接丢弃（不调用外部回调）
+        if (IsPlaybackActive()) {
+            ESP_LOGD(TAG, "Playback active: dropping microphone frame (len=%u)", (unsigned int)data.size());
+            return;
+        }
+
+        // 先通知本地回调（例如上传路径），再放入编码队列
         if (afe_output_callback_) {
             std::vector<int16_t> copy = data;
             afe_output_callback_(std::move(copy));
         }
+
         // 将 AFE 输出送入发送队列；PushTaskToEncodeQueue 自带丢弃策略避免阻塞
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
@@ -727,4 +735,13 @@ bool AudioService::IsAfeWakeWord() {
 #else
     return false;
 #endif
+}
+
+bool AudioService::IsPlaybackActive() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    if (!audio_playback_queue_.empty()) return true;
+    auto now = std::chrono::steady_clock::now();
+    auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
+    if (output_elapsed >= 0 && output_elapsed < 500) return true;
+    return false;
 }
