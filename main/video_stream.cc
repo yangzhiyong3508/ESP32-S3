@@ -69,7 +69,6 @@ static void video_stream_task(void *pvParameters) {
                          // 如果发送失败且API显示未连接，强制等待更久
                          if (!esp_websocket_client_is_connected(client)) {
                              ESP_LOGW(TAG, "Connection lost detected during send, pausing...");
-                             vTaskDelay(pdMS_TO_TICKS(2000));
                              continue;
                          }
                     } else {
@@ -83,7 +82,6 @@ static void video_stream_task(void *pvParameters) {
             }
         } else {
              // 未连接时，等待较长时间
-             vTaskDelay(pdMS_TO_TICKS(2000));
              // 断连时重置延迟
              current_delay = MIN_DELAY_MS;
              continue;
@@ -105,5 +103,5 @@ void start_video_stream(const std::string& url) {
 
     esp_websocket_client_start(client);
 
-    xTaskCreate(video_stream_task, "video_stream", 4096, NULL, 5, NULL);
+    xTaskCreate(video_stream_task, "video_stream", 4096, NULL, 2, NULL);
 }
