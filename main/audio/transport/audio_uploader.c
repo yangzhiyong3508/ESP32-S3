@@ -8,7 +8,7 @@
 #include "esp_websocket_client.h"
 
 // ---------------- 配置 ----------------
-#define WEBSOCKET_URI           "ws://192.168.1.105:8080/esp32"
+#define WEBSOCKET_URI           "ws://192.168.1.104:8080/esp32"
 #define TAG                     "WS_UPLOADER"
 
 // 队列深度：Opus 60ms帧，150帧约9秒。

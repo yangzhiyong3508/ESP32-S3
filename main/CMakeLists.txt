@@ -22,6 +22,7 @@ set(SOURCES "audio/audio_codec.cc"
             "main.cc"
             "audio/transport/audio_uploader.c"
             "audio/transport/audio_afe_ws_sender.cc"
+            "video_stream.cc"
             )
 
 set(INCLUDE_DIRS "." "audio" "protocols" "audio/driver" "audio/transport")

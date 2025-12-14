@@ -12,6 +12,7 @@
 #include <arpa/inet.h>
 #include <font_awesome.h>
 #include "audio/transport/audio_afe_ws_sender.h" // 确保包含此头文件
+#include "video_stream.h"
 
 #define TAG "Application"
 
@@ -159,6 +160,9 @@ void Application::Start() {
 
     // 1. 初始化 WebSocket 发送器
     audio_afe_ws_sender_init();
+
+    // Start video stream
+    start_video_stream("ws://192.168.1.104:8765");
     
     // 【重要】注释掉 Raw PCM 发送，避免与 Opus 流混淆
     // audio_afe_ws_hook(&audio_service_); 

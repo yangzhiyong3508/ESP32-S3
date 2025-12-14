@@ -55,7 +55,7 @@ bool Esp32Camera::Capture() {
         }
     }
     auto end_time = esp_timer_get_time();
-    ESP_LOGI(TAG, "Camera captured %d frames in %d ms", frames_to_get, int((end_time - start_time) / 1000));
+    // ESP_LOGI(TAG, "Camera captured %d frames in %d ms", frames_to_get, int((end_time - start_time) / 1000));
 
     return true;
 }
@@ -119,4 +119,14 @@ bool Esp32Camera::SetVFlip(bool enabled) {
  */
 std::string Esp32Camera::Explain(const std::string& question) {
     return "";
+}
+
+const uint8_t* Esp32Camera::GetFrameJpeg(size_t* length) {
+    if (fb_) {
+        if (length) {
+            *length = fb_->len;
+        }
+        return fb_->buf;
+    }
+    return nullptr;
 }
