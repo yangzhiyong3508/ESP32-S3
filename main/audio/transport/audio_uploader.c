@@ -8,7 +8,7 @@
 #include "esp_websocket_client.h"
 
 // ---------------- 配置 ----------------
-#define WEBSOCKET_URI           "ws://192.168.1.104:8080/esp32"
+#define WEBSOCKET_URI           "ws://118.195.133.25:8080/esp32"
 #define TAG                     "WS_UPLOADER"
 
 // 队列深度：Opus 60ms帧，150帧约9秒。
@@ -83,7 +83,8 @@ static void audio_send_task(void* arg) {
         if (xQueueReceive(send_queue, &item, portMAX_DELAY) == pdTRUE) {
             
             // 2. 检查连接状态
-            if (is_connected && ws_client != NULL) {
+            // 增加 esp_websocket_client_is_connected 检查，确保底层连接完全就绪
+            if (is_connected && ws_client != NULL && esp_websocket_client_is_connected(ws_client)) {
                 
                 int ret = esp_websocket_client_send_bin(ws_client, (const char*)item.buf, item.len, pdMS_TO_TICKS(WS_SEND_TIMEOUT_MS));
                 
@@ -95,7 +96,10 @@ static void audio_send_task(void* arg) {
                     is_connected = false; 
                     
                     // B. 释放当前包内存
-                    if (item.buf) free(item.buf); 
+                    if (item.buf) {
+                        free(item.buf); 
+                        item.buf = NULL; // 避免悬空指针
+                    }
 
                     // C. 清空所有积压队列 (避免延迟和内存泄漏)
                     clear_queue();
@@ -107,13 +111,18 @@ static void audio_send_task(void* arg) {
                     continue; // 跳过本次循环剩余部分，进入下一轮等待
                 }
             } else {
-                // 如果取出数据时发现已经断连了 (is_connected == false)
-                if (item.buf) free(item.buf);
+                // 如果未连接或连接未就绪，直接丢弃当前包
+                // ESP_LOGW(TAG, "WebSocket not connected or not ready, dropping audio packet.");
+                if (item.buf) {
+                    free(item.buf);
+                    item.buf = NULL;
+                }
             }
-
+            
             // 正常发送成功，释放内存
             if (item.buf) {
                 free(item.buf);
+                item.buf = NULL;
             }
         }
     }

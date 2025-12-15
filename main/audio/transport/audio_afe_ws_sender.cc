@@ -1,8 +1,10 @@
 #include "audio_uploader.h"
 #include "audio_service.h"
 #include "boards/common/wifi_connect.h"
+#include "boards/common/board.h"
 #include <esp_log.h>
 #include <memory>
+#include <string>
 
 #define TAG "AFE_WS_SENDER"
 
@@ -72,6 +74,22 @@ void audio_afe_ws_attach_downlink(AudioService* service) {
 
     audio_uploader_set_text_cb([](const char* data, size_t len) {
         ESP_LOGI(TAG, "WS text: %.*s", (int)len, data);
+        
+        // Handle volume control from server (numeric string "0"-"100")
+        if (len > 0 && len < 4) { // Volume string shouldn't be long
+            std::string text(data, len);
+            char* end;
+            long val = strtol(text.c_str(), &end, 10);
+            if (end != text.c_str() && *end == '\0') {
+                if (val >= 0 && val <= 100) {
+                    auto codec = Board::GetInstance().GetAudioCodec();
+                    if (codec) {
+                        codec->SetOutputVolume((int)val);
+                        ESP_LOGI(TAG, "Server set volume to %ld", val);
+                    }
+                }
+            }
+        }
     });
 }
 

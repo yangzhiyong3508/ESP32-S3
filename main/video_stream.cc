@@ -1,5 +1,6 @@
 #include "video_stream.h"
 #include "board.h"
+#include "audio/audio_codec.h"
 #include "esp_log.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
@@ -18,13 +19,24 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base, i
             is_connected = true;
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
+            ESP_LOGW(TAG, "WEBSOCKET_EVENT_DISCONNECTED");
             is_connected = false;
+            Board::GetInstance().GetDisplay()->ShowNotification("视频连接断开", 2000);
             break;
         case WEBSOCKET_EVENT_DATA:
+            if (data->op_code == WS_TRANSPORT_OPCODES_TEXT && data->data_len > 0 && data->data_ptr) {
+                std::string volume_str(data->data_ptr, data->data_len);
+                int volume = atoi(volume_str.c_str());
+                ESP_LOGI(TAG, "Received volume from server: %d", volume);
+                auto codec = Board::GetInstance().GetAudioCodec();
+                if (codec) {
+                    codec->SetOutputVolume(volume);
+                }
+            }
             break;
         case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGI(TAG, "WEBSOCKET_EVENT_ERROR");
+            ESP_LOGE(TAG, "WEBSOCKET_EVENT_ERROR");
+            Board::GetInstance().GetDisplay()->ShowNotification("视频连接错误", 2000);
             break;
     }
 }
@@ -94,7 +106,7 @@ void start_video_stream(const std::string& url) {
     esp_websocket_client_config_t websocket_cfg = {};
     websocket_cfg.uri = url.c_str();
     websocket_cfg.reconnect_timeout_ms = 10000;
-    websocket_cfg.network_timeout_ms = 10000;
+    websocket_cfg.network_timeout_ms = 20000;
     websocket_cfg.buffer_size = 20 * 1024; // 20KB RX buffer
     websocket_cfg.disable_auto_reconnect = false;
 
